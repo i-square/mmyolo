@@ -58,6 +58,8 @@ class YOLOv5CSPDarknet(BaseBackbone):
     # From left to right:
     # in_channels, out_channels, num_blocks, add_identity, use_spp
     arch_settings = {
+        'customize': [[32, 64, 3, True, False], [64, 128, 6, True, False],
+                      [128, 256, 9, True, False], [256, 512, 9, True, True]],
         'P5': [[64, 128, 3, True, False], [128, 256, 6, True, False],
                [256, 512, 9, True, False], [512, 1024, 3, True, True]],
         'P6': [[64, 128, 3, True, False], [128, 256, 6, True, False],
