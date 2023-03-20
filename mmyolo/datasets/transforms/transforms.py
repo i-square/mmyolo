@@ -165,6 +165,7 @@ class LetterResize(MMDET_Resize):
                  stretch_only: bool = False,
                  allow_scale_up: bool = True,
                  half_pad_param: bool = False,
+                 is_rescale_gt_bbox: bool = True,
                  **kwargs):
         super().__init__(scale=scale, keep_ratio=True, **kwargs)
 
@@ -178,6 +179,7 @@ class LetterResize(MMDET_Resize):
         self.stretch_only = stretch_only
         self.allow_scale_up = allow_scale_up
         self.half_pad_param = half_pad_param
+        self.is_rescale_gt_bbox = is_rescale_gt_bbox
 
     def _resize_img(self, results: dict):
         """Resize images with ``results['scale']``."""
@@ -304,6 +306,9 @@ class LetterResize(MMDET_Resize):
 
     def _resize_bboxes(self, results: dict):
         """Resize bounding boxes with ``results['scale_factor']``."""
+        if not self.is_rescale_gt_bbox:
+            return
+
         if results.get('gt_bboxes', None) is None:
             return
         results['gt_bboxes'].rescale_(results['scale_factor'])
