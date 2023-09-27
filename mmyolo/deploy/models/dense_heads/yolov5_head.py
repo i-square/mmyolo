@@ -187,3 +187,95 @@ def yolov5_head_module__forward__rknn(
     for i, feat in enumerate(x):
         out.append(self.convs_pred[i](feat))
     return out
+
+
+@FUNCTION_REWRITER.register_rewriter(
+    func_name='mmyolo.models.dense_heads.yolov5_head.'
+    'YOLOv5Head.predict_by_feat',
+    backend='ncnn')
+def yolov5_head__predict_by_feat__ncnn(self,
+                                 cls_scores: List[Tensor],
+                                 bbox_preds: List[Tensor],
+                                 objectnesses: Optional[List[Tensor]] = None,
+                                 batch_img_metas: Optional[List[dict]] = None,
+                                 cfg: Optional[ConfigDict] = None,
+                                 rescale: bool = False,
+                                 with_nms: bool = True) -> Tuple[InstanceData]:
+    ctx = FUNCTION_REWRITER.get_context()
+    from mmdeploy.codebase.mmdet.ops import ncnn_detection_output_forward
+    from mmdeploy.utils import get_root_logger
+    from mmdeploy.utils.config_utils import is_dynamic_shape
+    dynamic_flag = is_dynamic_shape(ctx.cfg)
+    if dynamic_flag:
+        logger = get_root_logger()
+        logger.warning('YOLOV5 does not support dynamic shape with ncnn.')
+    img_height = int(batch_img_metas[0]['img_shape'][0])
+    img_width = int(batch_img_metas[0]['img_shape'][1])
+
+    assert len(cls_scores) == len(bbox_preds) == len(objectnesses)
+    device = cls_scores[0].device
+    dtype = cls_scores[0].dtype
+    cfg = self.test_cfg if cfg is None else cfg
+    batch_size = bbox_preds[0].shape[0]
+    featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
+    mlvl_priors = self.prior_generator.grid_priors(
+        featmap_sizes, dtype=dtype, device=device)
+        #featmap_sizes, dtype=dtype, device=device, with_stride=True)
+    mlvl_priors = [mlvl_prior.unsqueeze(0) for mlvl_prior in mlvl_priors]
+    flatten_priors = torch.cat(mlvl_priors, dim=1)
+    flatten_cls_scores = [
+        cls_score.permute(0, 2, 3, 1).reshape(batch_size, -1,
+                                              self.num_classes)
+        for cls_score in cls_scores
+    ]
+    flatten_bbox_preds = [
+        bbox_pred.permute(0, 2, 3, 1).reshape(batch_size, -1, 4)
+        for bbox_pred in bbox_preds
+    ]
+    flatten_objectness = [
+        objectness.permute(0, 2, 3, 1).reshape(batch_size, -1, 1)
+        for objectness in objectnesses
+    ]
+
+    cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
+    dummy_cls_scores = torch.zeros(
+        batch_size, cls_scores.shape[-2], 1, device=cls_scores.device)
+    batch_mlvl_scores = torch.cat([dummy_cls_scores, cls_scores], dim=2)
+    score_factor = torch.cat(flatten_objectness, dim=1).sigmoid()
+    flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
+    assert flatten_priors.shape[-1] == 4, f'yolov5 needs (B, N, 4) priors, got\
+            (B, N, {flatten_priors.shape[-1]})'
+    prior_box_x1 = (flatten_priors[:, :, 0:1] - flatten_priors[:, :, 2:3] / 2) \
+                   / img_width
+    prior_box_y1 = (flatten_priors[:, :, 1:2] - flatten_priors[:, :, 3:4] / 2) \
+                   / img_height
+    prior_box_x2 = (flatten_priors[:, :, 0:1] + flatten_priors[:, :, 2:3] / 2) \
+                   / img_width
+    prior_box_y2 = (flatten_priors[:, :, 1:2] + flatten_priors[:, :, 3:4] / 2) \
+                   / img_height
+    prior_box_ncnn = torch.cat(
+        [prior_box_x1, prior_box_y1, prior_box_x2, prior_box_y2], dim=2)
+
+    scores = batch_mlvl_scores.permute(0, 2, 1).unsqueeze(3) * \
+             score_factor.permute(0, 2, 1).unsqueeze(3)
+    scores = scores.squeeze(3).permute(0, 2, 1)
+
+    batch_mlvl_bboxes = flatten_bbox_preds.reshape(batch_size, 1, -1)
+    batch_mlvl_scores = scores.reshape(batch_size, 1, -1)
+    batch_mlvl_priors = prior_box_ncnn.reshape(batch_size, 1, -1)
+    batch_mlvl_vars = torch.ones_like(batch_mlvl_priors)
+    batch_mlvl_priors = torch.cat([batch_mlvl_priors, batch_mlvl_vars], dim=1)
+    deploy_cfg = ctx.cfg
+    post_params = get_post_processing_params(deploy_cfg)
+    iou_threshold = cfg.nms.get('iou_threshold', post_params.iou_threshold)
+    score_threshold = cfg.get('score_thr', post_params.score_threshold)
+    pre_top_k = post_params.pre_top_k
+    keep_top_k = cfg.get('max_per_img', post_params.keep_top_k)
+
+    vars = torch.tensor([1, 1, 1, 1], dtype=torch.float32)
+    output__ncnn = ncnn_detection_output_forward(
+        batch_mlvl_bboxes, batch_mlvl_scores, batch_mlvl_priors,
+        score_threshold, iou_threshold, pre_top_k, keep_top_k,
+        self.num_classes + 1,
+        vars.cpu().detach().numpy())
+    return output__ncnn
