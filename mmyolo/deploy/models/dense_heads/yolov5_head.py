@@ -218,11 +218,23 @@ def yolov5_head__predict_by_feat__ncnn(self,
     cfg = self.test_cfg if cfg is None else cfg
     batch_size = bbox_preds[0].shape[0]
     featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
-    mlvl_priors = self.prior_generator.grid_priors(
-        featmap_sizes, dtype=dtype, device=device)
-        #featmap_sizes, dtype=dtype, device=device, with_stride=True)
-    mlvl_priors = [mlvl_prior.unsqueeze(0) for mlvl_prior in mlvl_priors]
-    flatten_priors = torch.cat(mlvl_priors, dim=1)
+
+    # If the shape does not change, use the previous mlvl_priors
+    if featmap_sizes != self.featmap_sizes:
+        self.mlvl_priors = self.prior_generator.grid_priors(
+            featmap_sizes,
+            dtype=dtype,
+            device=device)
+        self.featmap_sizes = featmap_sizes
+    flatten_priors = torch.cat(self.mlvl_priors)
+
+    mlvl_strides = [
+        flatten_priors.new_full(
+            (featmap_size.numel() * self.num_base_priors, ), stride) for
+        featmap_size, stride in zip(featmap_sizes, self.featmap_strides)
+    ]
+    flatten_stride = torch.cat(mlvl_strides)
+
     flatten_cls_scores = [
         cls_score.permute(0, 2, 3, 1).reshape(batch_size, -1,
                                               self.num_classes)
@@ -242,29 +254,28 @@ def yolov5_head__predict_by_feat__ncnn(self,
         batch_size, cls_scores.shape[-2], 1, device=cls_scores.device)
     batch_mlvl_scores = torch.cat([dummy_cls_scores, cls_scores], dim=2)
     score_factor = torch.cat(flatten_objectness, dim=1).sigmoid()
-    flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
-    assert flatten_priors.shape[-1] == 4, f'yolov5 needs (B, N, 4) priors, got\
-            (B, N, {flatten_priors.shape[-1]})'
-    prior_box_x1 = (flatten_priors[:, :, 0:1] - flatten_priors[:, :, 2:3] / 2) \
-                   / img_width
-    prior_box_y1 = (flatten_priors[:, :, 1:2] - flatten_priors[:, :, 3:4] / 2) \
-                   / img_height
-    prior_box_x2 = (flatten_priors[:, :, 0:1] + flatten_priors[:, :, 2:3] / 2) \
-                   / img_width
-    prior_box_y2 = (flatten_priors[:, :, 1:2] + flatten_priors[:, :, 3:4] / 2) \
-                   / img_height
-    prior_box_ncnn = torch.cat(
-        [prior_box_x1, prior_box_y1, prior_box_x2, prior_box_y2], dim=2)
-
     scores = batch_mlvl_scores.permute(0, 2, 1).unsqueeze(3) * \
              score_factor.permute(0, 2, 1).unsqueeze(3)
     scores = scores.squeeze(3).permute(0, 2, 1)
 
-    batch_mlvl_bboxes = flatten_bbox_preds.reshape(batch_size, 1, -1)
+    flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
+    assert flatten_bbox_preds.shape[-1] == 4, f'yolov5 needs (B, N, 4) priors, got\
+            (B, N, {flatten_bbox_preds.shape[-1]})'
+
+    flatten_decoded_bboxes = self.bbox_coder.decode(
+        flatten_priors[None], flatten_bbox_preds, flatten_stride)
+    t_x1 = flatten_decoded_bboxes[:, :, 0:1] / img_width
+    t_y1 = flatten_decoded_bboxes[:, :, 1:2] / img_height
+    t_x2 = flatten_decoded_bboxes[:, :, 2:3] / img_width
+    t_y2 = flatten_decoded_bboxes[:, :, 3:4] / img_height
+    flatten_decoded_bboxes = torch.cat([t_x1, t_y1, t_x2, t_y2], dim=2)
+
+    batch_mlvl_bboxes = flatten_decoded_bboxes.reshape(batch_size, 1, -1)
     batch_mlvl_scores = scores.reshape(batch_size, 1, -1)
-    batch_mlvl_priors = prior_box_ncnn.reshape(batch_size, 1, -1)
-    batch_mlvl_vars = torch.ones_like(batch_mlvl_priors)
-    batch_mlvl_priors = torch.cat([batch_mlvl_priors, batch_mlvl_vars], dim=1)
+    dummy_mlvl_priors = torch.ones_like(batch_mlvl_bboxes)
+    dummy_mlvl_vars = torch.ones_like(batch_mlvl_bboxes)
+    batch_mlvl_priors = torch.cat([dummy_mlvl_priors, dummy_mlvl_vars], dim=1)
+
     deploy_cfg = ctx.cfg
     post_params = get_post_processing_params(deploy_cfg)
     iou_threshold = cfg.nms.get('iou_threshold', post_params.iou_threshold)
